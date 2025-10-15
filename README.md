@@ -355,27 +355,925 @@ References:
 4. [Improved Techniques for Training GANs](https://arxiv.org/abs/1606.03498), Salimans et al. 2016
 5. [A Style-Based Generator Architecture for Generative Adversarial Networks](https://arxiv.org/abs/1812.04948), Karras et al. 2018
 
-## License
+# StyleGAN2-ADA: Architecture & Implementation Guide
 
-Copyright &copy; 2021, NVIDIA Corporation. All rights reserved.
+## Table of Contents
+- [Overview](#overview)
+- [Core Components](#core-components)
+- [Generator Architecture](#generator-architecture)
+- [Discriminator Architecture](#discriminator-architecture)
+- [Loss Functions](#loss-functions)
+- [Adaptive Discriminator Augmentation](#adaptive-discriminator-augmentation)
+- [Training Pipeline](#training-pipeline)
+- [Architecture Parameters](#architecture-parameters)
+- [Data Flow](#data-flow)
 
-This work is made available under the [Nvidia Source Code License](https://nvlabs.github.io/stylegan2-ada-pytorch/license.html).
+---
 
-## Citation
+## PERSONAL Overview
+
+**StyleGAN2-ADA** (StyleGAN2 with Adaptive Discriminator Augmentation) is a state-of-the-art Generative Adversarial Network architecture designed for high-quality image generation, particularly effective when training with limited data.
+
+### Key Capabilities
+- Generate photorealistic images at resolutions up to 1024×1024
+- Train effectively with datasets as small as a few thousand images
+- Support transfer learning from pre-trained models
+- Enable conditional generation based on class labels
+- Achieve state-of-the-art FID scores with adaptive augmentation
+
+### Main Innovation
+**Adaptive Discriminator Augmentation (ADA)** dynamically adjusts data augmentation probability during training to prevent discriminator overfitting without requiring architectural modifications.
+
+---
+
+## Core Components
+
+The StyleGAN2-ADA architecture consists of three main components:
 
 ```
-@inproceedings{Karras2020ada,
-  title     = {Training Generative Adversarial Networks with Limited Data},
-  author    = {Tero Karras and Miika Aittala and Janne Hellsten and Samuli Laine and Jaakko Lehtinen and Timo Aila},
-  booktitle = {Proc. NeurIPS},
-  year      = {2020}
-}
+┌─────────────────────────────────────────────────────────────┐
+│                      StyleGAN2-ADA                          │
+├─────────────────────────────────────────────────────────────┤
+│  1. Generator (G)                                           │
+│     ├── Mapping Network (z → W)                             │
+│     └── Synthesis Network (W → Image)                       │
+│                                                              │
+│  2. Discriminator (D)                                       │
+│     ├── Progressive Downsampling Blocks                     │
+│     └── Minibatch Discrimination                            │
+│                                                              │
+│  3. Augmentation Pipeline (ADA)                             │
+│     └── Adaptive probability adjustment                     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Development
+---
 
-This is a research reference implementation and is treated as a one-time code drop. As such, we do not accept outside code contributions in the form of pull requests.
+## Generator Architecture
 
-## Acknowledgements
+The Generator transforms random noise into realistic images through a two-stage process.
 
-We thank David Luebke for helpful comments; Tero Kuosmanen and Sabu Nadarajan for their support with compute infrastructure; and Edgar Sch&ouml;nfeld for guidance on setting up unconditional BigGAN.
+### 1. Mapping Network
+
+**Purpose:** Map random latent codes to an intermediate latent space with better properties for image generation.
+
+```
+Input:  z ∈ ℝ^512 (random Gaussian noise)
+        c ∈ ℝ^c_dim (conditional label, optional)
+
+Architecture:
+┌─────────────────────────────────────────┐
+│  Conditional Embedding (if c_dim > 0)   │
+│  ├── Input: c (class labels)            │
+│  └── Output: embed ∈ ℝ^512              │
+├─────────────────────────────────────────┤
+│  8× Fully Connected Layers              │
+│  ├── Input dim: 512 (+ embed_dim)       │
+│  ├── Hidden dim: 512                    │
+│  ├── Activation: Leaky ReLU             │
+│  ├── LR multiplier: 0.01                │
+│  └── Output: W ∈ ℝ^512                  │
+├─────────────────────────────────────────┤
+│  Broadcasting                            │
+│  └── W → [W₁, W₂, ..., W_n]            │
+│      (one style vector per layer)       │
+└─────────────────────────────────────────┘
+
+Output: W^+ ∈ ℝ^(n×512) where n = num synthesis layers
+```
+
+**Key Features:**
+- **2nd Moment Normalization:** Normalizes inputs for stable training
+- **Moving Average Tracking:** Enables truncation trick for quality/diversity trade-off
+- **Style Mixing:** During training, randomly mixes styles from two latent codes (prob=0.9)
+
+### 2. Synthesis Network
+
+**Purpose:** Generate images progressively from low to high resolution using style-based modulation.
+
+```
+Resolution Progression (for 1024×1024 output):
+4 → 8 → 16 → 32 → 64 → 128 → 256 → 512 → 1024
+
+Each Synthesis Block:
+┌──────────────────────────────────────────────────────┐
+│  Input Processing                                     │
+│  ├── First block (4×4): Learned constant             │
+│  └── Other blocks: Upsampled features (2×)           │
+├──────────────────────────────────────────────────────┤
+│  Synthesis Layer 1 (Modulated Conv)                  │
+│  ├── Affine transform: W → style                     │
+│  ├── Modulated 3×3 convolution                       │
+│  │   ├── Weight modulation by style                  │
+│  │   ├── Weight demodulation                         │
+│  │   └── Fused modulated convolution                 │
+│  ├── Noise injection (learned weight)                │
+│  ├── Bias addition                                   │
+│  └── Activation: Leaky ReLU                          │
+├──────────────────────────────────────────────────────┤
+│  Synthesis Layer 2 (Modulated Conv)                  │
+│  └── [Same structure as Layer 1]                     │
+├──────────────────────────────────────────────────────┤
+│  ToRGB Layer (converts features to RGB)              │
+│  ├── Style-modulated 1×1 convolution                 │
+│  ├── No demodulation                                 │
+│  └── Output: RGB image at current resolution         │
+├──────────────────────────────────────────────────────┤
+│  Skip Connection (progressive growth)                │
+│  └── Upsample previous RGB + current RGB             │
+└──────────────────────────────────────────────────────┘
+```
+
+**Channel Configuration** (channel_base=32768, channel_max=512):
+
+| Resolution | Channels | Operations per Block |
+|------------|----------|---------------------|
+| 4×4        | 512      | 1 conv + toRGB      |
+| 8×8        | 512      | 2 conv + toRGB      |
+| 16×16      | 512      | 2 conv + toRGB      |
+| 32×32      | 512      | 2 conv + toRGB      |
+| 64×64      | 512      | 2 conv + toRGB      |
+| 128×128    | 256      | 2 conv + toRGB      |
+| 256×256    | 128      | 2 conv + toRGB      |
+| 512×512    | 64       | 2 conv + toRGB      |
+| 1024×1024  | 32       | 2 conv + toRGB      |
+
+**Total W vectors needed:** ~26 (varies by resolution)
+
+**Key Innovations:**
+
+1. **Modulated Convolution:**
+   ```
+   w' = w · style     (per-sample weight modulation)
+   w'' = w' / √(Σw'²) (weight demodulation)
+   output = Conv(x, w'') + noise + bias
+   ```
+
+2. **Noise Injection:**
+   - Per-pixel Gaussian noise scaled by learned parameter
+   - Enables stochastic variation in generated images
+   - Different noise per resolution level
+
+3. **Progressive Growth:**
+   - Image built from 4×4 upward
+   - Each resolution adds detail
+   - Skip connections merge RGB outputs
+
+4. **Mixed Precision Training:**
+   - FP16 for resolutions ≥ 128×128 (configurable)
+   - FP32 for lower resolutions
+   - Activation clamping prevents overflow
+
+---
+
+## Discriminator Architecture
+
+The Discriminator evaluates image authenticity through progressive downsampling, mirroring the Generator in reverse.
+
+```
+Input: RGB Image (e.g., 1024×1024×3)
+
+Architecture (ResNet-based):
+┌──────────────────────────────────────────────────────┐
+│  Progressive Downsampling                             │
+│  Resolution: 1024 → 512 → 256 → 128 → 64 → 32 → 16 → 8 │
+│                                                        │
+│  Each Discriminator Block:                            │
+│  ├── FromRGB (1×1 conv, for skip connections)        │
+│  ├── Conv Block 1:                                    │
+│  │   ├── 3×3 Convolution (same resolution)           │
+│  │   └── Leaky ReLU activation                       │
+│  ├── Conv Block 2:                                    │
+│  │   ├── 3×3 Convolution (downsample 2×)             │
+│  │   └── Leaky ReLU activation                       │
+│  └── Skip Connection (ResNet):                        │
+│      └── 1×1 Conv + downsample 2×                    │
+└──────────────────────────────────────────────────────┘
+
+Epilogue Block (4×4 resolution):
+┌──────────────────────────────────────────────────────┐
+│  Minibatch Standard Deviation Layer                   │
+│  ├── Compute std across minibatch groups             │
+│  ├── Group size: 4 (default)                         │
+│  └── Append as extra channel                         │
+├──────────────────────────────────────────────────────┤
+│  3×3 Convolution (512 channels)                      │
+│  └── Leaky ReLU                                      │
+├──────────────────────────────────────────────────────┤
+│  Flatten + Fully Connected                           │
+│  ├── Input: 512 × 4 × 4 = 8192                       │
+│  └── Output: 512 features                            │
+├──────────────────────────────────────────────────────┤
+│  Output Layer                                         │
+│  ├── Unconditional: 1 logit (real/fake score)       │
+│  └── Conditional: cmap_dim logits                    │
+│                                                        │
+│  Conditional Projection (if c_dim > 0):              │
+│  └── logit = (output · c_embedding).sum()           │
+└──────────────────────────────────────────────────────┘
+```
+
+**Channel Configuration** (reverse of Generator):
+
+| Resolution | Input Channels | Output Channels |
+|------------|----------------|-----------------|
+| 1024×1024  | 3 (RGB)        | 32              |
+| 512×512    | 32             | 64              |
+| 256×256    | 64             | 128             |
+| 128×128    | 128            | 256             |
+| 64×64      | 256            | 512             |
+| 32×32      | 512            | 512             |
+| 16×16      | 512            | 512             |
+| 8×8        | 512            | 512             |
+| 4×4        | 512            | 512             |
+
+**Key Features:**
+
+1. **ResNet Skip Connections:**
+   - Improves gradient flow
+   - Enables deeper discriminator
+   - Better feature learning
+
+2. **Minibatch Standard Deviation:**
+   - Encourages diversity in generated samples
+   - Computes statistics across minibatch groups
+   - Prevents mode collapse
+
+3. **Progressive Analysis:**
+   - Analyzes images at multiple scales
+   - FromRGB at each resolution for skip architecture
+   - Hierarchical feature extraction
+
+4. **Mixed Precision:**
+   - FP16 for high-resolution layers
+   - FP32 for final classification layers
+
+---
+
+## Loss Functions
+
+### Generator Loss
+
+**Objective:** Fool the discriminator while maintaining high-quality, diverse outputs.
+
+#### 1. Main Loss (Non-saturating GAN Loss)
+```python
+L_Gmain = 𝔼[softplus(-D(G(z)))]
+        = 𝔼[-log(sigmoid(D(G(z))))]
+```
+
+**Interpretation:** Maximize discriminator's confidence that generated images are real.
+
+#### 2. Path Length Regularization (PPL)
+```python
+L_Gpl = 𝔼[(||J_W^T y||₂ - a)²] × pl_weight
+
+where:
+- J_W = Jacobian of G(W) w.r.t. W
+- y = random image-space direction
+- a = exponential moving average of path lengths
+- pl_weight = 2.0 (default)
+```
+
+**Purpose:**
+- Encourages smooth, well-behaved latent space
+- Improves interpolation quality
+- Reduces artifacts
+
+**Total Generator Loss:**
+```python
+L_G = L_Gmain + L_Gpl
+```
+
+### Discriminator Loss
+
+**Objective:** Distinguish real from fake images while maintaining smooth decision boundaries.
+
+#### 1. Main Loss (Non-saturating)
+```python
+L_Dmain = 𝔼[softplus(-D(x_real))] + 𝔼[softplus(D(G(z)))]
+        = -𝔼[log(sigmoid(D(x_real)))] - 𝔼[log(1 - sigmoid(D(G(z))))]
+```
+
+**Interpretation:**
+- Maximize confidence on real images
+- Minimize confidence on fake images
+
+#### 2. R1 Regularization (Gradient Penalty)
+```python
+L_Dr1 = (γ/2) × 𝔼[||∇_x D(x_real)||²]
+
+where:
+- γ (gamma) = regularization strength
+- Default γ = 10.0 for 1024×1024
+- Scales with resolution: γ = 0.0002 × (resolution²) / batch_size
+```
+
+**Purpose:**
+- Penalizes large gradients on real data manifold
+- Smooths discriminator decision boundaries
+- Improves training stability
+
+**Lazy Regularization:**
+- R1 applied every 16 iterations (not every step)
+- Reduces computational cost
+- Effective regularization with lower overhead
+
+**Total Discriminator Loss:**
+```python
+L_D = L_Dmain + L_Dr1
+```
+
+### Training Phases
+
+Training alternates between four phases:
+
+```python
+1. Gmain: Update G to maximize D(G(z))
+2. Greg:  Update G with path length regularization
+3. Dmain: Update D to classify real/fake
+4. Dreg:  Update D with R1 gradient penalty
+
+Schedule:
+- Gmain every iteration
+- Greg every iteration (if pl_weight > 0)
+- Dmain every iteration
+- Dreg every 16 iterations (lazy regularization)
+```
+
+---
+
+## Adaptive Discriminator Augmentation
+
+**Problem:** Limited training data causes discriminator to memorize/overfit, leading to training collapse.
+
+**Solution:** Adaptively augment real images fed to discriminator, adjusting augmentation strength based on overfitting indicators.
+
+### Augmentation Pipeline
+
+```
+┌─────────────────────────────────────────────────────┐
+│  1. Pixel Blitting                                  │
+│     ├── Horizontal flip (xflip)                     │
+│     ├── 90° rotations (rotate90)                    │
+│     └── Integer translations (xint)                 │
+├─────────────────────────────────────────────────────┤
+│  2. Geometric Transformations                       │
+│     ├── Isotropic scaling (scale)                   │
+│     ├── Arbitrary rotation (rotate)                 │
+│     ├── Anisotropic scaling (aniso)                 │
+│     └── Fractional translation (xfrac)              │
+├─────────────────────────────────────────────────────┤
+│  3. Color Transformations                           │
+│     ├── Brightness adjustment                       │
+│     ├── Contrast adjustment                         │
+│     ├── Luma flip                                   │
+│     ├── Hue rotation                                │
+│     └── Saturation adjustment                       │
+├─────────────────────────────────────────────────────┤
+│  4. Image Filtering                                 │
+│     └── Wavelet-based filters (low/high pass)      │
+├─────────────────────────────────────────────────────┤
+│  5. Noise & Cutout                                  │
+│     ├── Additive Gaussian noise                     │
+│     └── Random rectangular cutouts                  │
+└─────────────────────────────────────────────────────┘
+
+Global Probability Multiplier: p ∈ [0, 1]
+```
+
+### Adaptive Mechanism
+
+**Key Idea:** Monitor discriminator overfitting and adjust augmentation probability.
+
+```python
+Overfitting Indicator:
+r_t = 𝔼[sign(D(x_real))]
+
+Target value: r_target = 0.6
+- If r_t > 0.6: D is overfitting → increase p
+- If r_t < 0.6: D is underfitting → decrease p
+
+Update Rule (every 4 training images):
+p ← p + sign(r_t - r_target) × (batch_size / 500)
+
+Constraints:
+- p starts at 0
+- p ∈ [0, 1]
+- Separate tracking for real/fake statistics
+```
+
+**Benefits:**
+- No manual tuning of augmentation strength
+- Automatically adapts to dataset size
+- Works with any GAN architecture
+- Prevents discriminator overfitting without architectural changes
+
+### Augmentation Configuration
+
+**Common presets:**
+
+```python
+# No augmentation (sufficient data)
+--aug=noaug
+
+# Fixed augmentation
+--aug=ada      # Adaptive (default)
+--aug=fixed    # Fixed probability
+
+# Custom augmentation probability
+--augpipe=bgc  # Brightness, geometric, color
+--ada-target=0.6  # Target overfitting metric
+```
+
+---
+
+## Training Pipeline
+
+### Optimization Configuration
+
+```yaml
+Generator Optimizer:
+  type: Adam
+  learning_rate: 0.002
+  betas: [0.0, 0.99]
+  eps: 1e-8
+  
+Discriminator Optimizer:
+  type: Adam
+  learning_rate: 0.002
+  betas: [0.0, 0.99]
+  eps: 1e-8
+
+Exponential Moving Average (EMA):
+  enabled: true
+  half_life: 10k images
+  rampup: 5% of training (for smooth start)
+```
+
+### Training Schedule
+
+```yaml
+Default Configuration (auto):
+  total_kimg: 25000        # 25 million images
+  batch_size: auto         # Based on resolution & GPUs
+  metrics: [fid50k_full]   # Quality evaluation
+  snap_interval: 50 ticks  # Checkpoint frequency
+  
+Resolution-Specific Adjustments:
+  1024×1024:
+    batch_size: 32 (8 GPUs)
+    gamma: 10.0
+    lr: 0.002
+  
+  512×512:
+    batch_size: 64 (8 GPUs)
+    gamma: 2.56
+    lr: 0.0025
+  
+  256×256:
+    batch_size: 64 (8 GPUs)
+    gamma: 1.0
+    lr: 0.0025
+```
+
+### Data Flow During Training
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Iteration Step                                         │
+├─────────────────────────────────────────────────────────┤
+│  1. Sample Data                                         │
+│     ├── z ~ N(0, I) ∈ ℝ^(batch×512)                    │
+│     ├── c ~ dataset labels (if conditional)            │
+│     └── x_real ~ dataset images                        │
+├─────────────────────────────────────────────────────────┤
+│  2. Generator Forward Pass                              │
+│     ├── W ← MappingNetwork(z, c)                       │
+│     ├── Apply style mixing (90% prob)                  │
+│     └── x_fake ← SynthesisNetwork(W)                   │
+├─────────────────────────────────────────────────────────┤
+│  3. Apply Augmentation                                  │
+│     ├── x_real_aug ← AugmentPipe(x_real, p)           │
+│     └── x_fake_aug ← AugmentPipe(x_fake, p)           │
+├─────────────────────────────────────────────────────────┤
+│  4. Discriminator Evaluation                            │
+│     ├── logits_real ← D(x_real_aug, c)                │
+│     └── logits_fake ← D(x_fake_aug, c)                │
+├─────────────────────────────────────────────────────────┤
+│  5. Compute Losses                                      │
+│     ├── L_Gmain = softplus(-logits_fake)              │
+│     ├── L_Gpl = path_length_penalty (if Greg phase)   │
+│     ├── L_Dmain = softplus(-logits_real) +            │
+│     │             softplus(logits_fake)                │
+│     └── L_Dr1 = gradient_penalty (if Dreg phase)      │
+├─────────────────────────────────────────────────────────┤
+│  6. Backward Pass & Updates                             │
+│     ├── ∇L_G → Update G parameters                    │
+│     ├── ∇L_D → Update D parameters                    │
+│     └── Update G_ema (exponential moving average)     │
+├─────────────────────────────────────────────────────────┤
+│  7. Update Augmentation Probability                     │
+│     └── p ← p + adjust_step (every 4 imgs)            │
+├─────────────────────────────────────────────────────────┤
+│  8. Logging & Checkpointing                             │
+│     ├── Log training statistics                        │
+│     ├── Evaluate metrics (periodic)                    │
+│     └── Save checkpoints (every 50 ticks)             │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Architecture Parameters
+
+### Default Configurations
+
+#### Auto Configuration (Recommended)
+```python
+# Automatically selects parameters based on resolution and GPU count
+--cfg=auto
+
+Parameters selected dynamically:
+- batch_size: Based on GPU memory
+- gamma: Scales with resolution²
+- learning_rate: Optimized per resolution
+- channel_multiplier: Based on resolution
+```
+
+#### StyleGAN2 Configuration
+```python
+# Reproduce original StyleGAN2 results
+--cfg=stylegan2
+
+Fixed parameters:
+  ref_gpus: 8
+  batch_size: 32
+  mbstd_group_size: 4
+  channel_base: 32768 (fmaps=1)
+  learning_rate: 0.002
+  gamma: 10.0
+  ema_kimg: 10
+  mapping_layers: 8
+```
+
+#### Resolution-Specific Presets
+
+```python
+# 256×256 (paper256)
+--cfg=paper256
+  batch_size: 64
+  gamma: 1.0
+  channel_base: 16384 (fmaps=0.5)
+  
+# 512×512 (paper512)
+--cfg=paper512
+  batch_size: 64
+  gamma: 2.56
+  channel_base: 16384 (fmaps=0.5)
+  
+# 1024×1024 (paper1024)
+--cfg=paper1024
+  batch_size: 32
+  gamma: 10.0
+  channel_base: 32768 (fmaps=1)
+```
+
+### Complete Parameter Reference
+
+```python
+Generator Architecture:
+  z_dim: 512                    # Input latent dimension
+  w_dim: 512                    # Intermediate latent dimension
+  c_dim: 0                      # Conditional dimension (0=unconditional)
+  img_resolution: 1024          # Output resolution
+  img_channels: 3               # RGB channels
+  mapping_layers: 8             # Mapping network depth
+  channel_base: 32768           # Base channel multiplier
+  channel_max: 512              # Max channels per layer
+  num_fp16_res: 4               # FP16 for top N resolutions
+  conv_clamp: 256               # Activation clamping
+
+Discriminator Architecture:
+  c_dim: 0                      # Conditional dimension
+  img_resolution: 1024          # Input resolution
+  img_channels: 3               # RGB channels
+  architecture: 'resnet'        # 'orig', 'skip', 'resnet'
+  channel_base: 32768           # Base channel multiplier
+  channel_max: 512              # Max channels per layer
+  num_fp16_res: 4               # FP16 for top N resolutions
+  conv_clamp: 256               # Activation clamping
+  mbstd_group_size: 4           # Minibatch std group size
+
+Loss Configuration:
+  style_mixing_prob: 0.9        # Style mixing probability
+  r1_gamma: 10.0                # R1 regularization weight
+  pl_weight: 2.0                # Path length regularization
+  pl_batch_shrink: 2            # PL batch size divisor
+  pl_decay: 0.01                # PL moving average decay
+
+Training Configuration:
+  batch_size: 32                # Total batch size
+  batch_gpu: 4                  # Per-GPU batch size
+  total_kimg: 25000             # Training duration (kimgs)
+  ema_kimg: 10                  # EMA half-life
+  ema_rampup: 0.05              # EMA rampup ratio
+
+Augmentation:
+  ada_target: 0.6               # Target overfitting metric
+  augment_p: 0.0                # Initial augmentation prob
+  ada_kimg: 500                 # ADA update interval
+```
+
+---
+
+## Data Flow
+
+### Complete Pipeline Visualization
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    TRAINING ITERATION                        │
+└─────────────────────────────────────────────────────────────┘
+
+INPUT PREPARATION
+─────────────────
+Real Images               Random Latent           Labels
+x_real ~ Dataset         z ~ N(0,I)^512          c (optional)
+     │                        │                        │
+     │                   ┌────▼────┐                  │
+     │                   │ Mapping  │◄─────────────────┘
+     │                   │ Network  │
+     │                   └────┬────┘
+     │                        │
+     │                   Style W ∈ ℝ^(26×512)
+     │                        │
+     │                   ┌────▼────────┐
+     │                   │   Synthesis  │
+     │                   │   Network    │
+     │                   └────┬────────┘
+     │                        │
+     │                   Generated Images
+     │                   x_fake ∈ ℝ^(3×1024×1024)
+     │                        │
+     └────────┬───────────────┘
+              │
+         ┌────▼────┐
+         │   ADA   │  Adaptive Augmentation
+         │Pipeline │  (probability p)
+         └────┬────┘
+              │
+    ┌─────────┴──────────┐
+    │                    │
+x_real_aug          x_fake_aug
+    │                    │
+    └─────────┬──────────┘
+              │
+         ┌────▼──────┐
+         │Discrimin- │
+         │   ator    │
+         └────┬──────┘
+              │
+    ┌─────────┴──────────┐
+    │                    │
+logits_real         logits_fake
+    │                    │
+    └─────────┬──────────┘
+              │
+         ┌────▼────┐
+         │ Losses  │
+         │ L_G, L_D│
+         └────┬────┘
+              │
+         ┌────▼────┐
+         │Backward │
+         │  Pass   │
+         └────┬────┘
+              │
+         ┌────▼────┐
+         │Optimizer│
+         │ Updates │
+         └─────────┘
+
+GENERATOR PATH:  z → W → x_fake → D → L_G → ∇_G
+DISCRIMINATOR:   x → aug → D → L_D → ∇_D
+```
+
+### Memory Layout
+
+```
+Tensor Shapes (batch_size=4, resolution=1024):
+
+Latents:
+  z:        [4, 512]              ~8 KB
+  c:        [4, c_dim]            variable
+  W:        [4, 26, 512]          ~208 KB
+
+Generated Images:
+  x_fake:   [4, 3, 1024, 1024]   ~48 MB (FP32)
+  
+Intermediate Features (synthesis):
+  4×4:      [4, 512, 4, 4]       ~32 KB
+  8×8:      [4, 512, 8, 8]       ~128 KB
+  16×16:    [4, 512, 16, 16]     ~512 KB
+  32×32:    [4, 512, 32, 32]     ~2 MB
+  64×64:    [4, 512, 64, 64]     ~8 MB
+  128×128:  [4, 256, 128, 128]   ~8 MB
+  256×256:  [4, 128, 256, 256]   ~8 MB
+  512×512:  [4, 64, 512, 512]    ~8 MB
+  1024×1024:[4, 32, 1024, 1024]  ~8 MB
+
+Discriminator Features (reverse progression)
+  Similar memory pattern in reverse
+
+Total GPU Memory Usage:
+  ~12-15 GB per GPU (1024×1024, mixed precision)
+```
+
+---
+
+## File Structure & Responsibilities
+
+```
+stylegan2-ada-pytorch/
+├── train.py                    # Main training script
+├── generate.py                 # Image generation
+├── projector.py                # Project images to latent space
+├── style_mixing.py             # Style mixing visualization
+├── calc_metrics.py             # Compute quality metrics
+├── dataset_tool.py             # Dataset preparation
+│
+├── training/
+│   ├── networks.py             # G & D architectures
+│   │   ├── Generator           # Complete generator
+│   │   │   ├── MappingNetwork  # z → W
+│   │   │   └── SynthesisNetwork# W → image
+│   │   ├── Discriminator       # Complete discriminator
+│   │   │   ├── DiscriminatorBlock
+│   │   │   └── DiscriminatorEpilogue
+│   │   └── Layers              # Building blocks
+│   │       ├── SynthesisLayer  # Modulated conv
+│   │       ├── ToRGBLayer      # Feature to RGB
+│   │       ├── Conv2dLayer     # Standard conv
+│   │       └── FullyConnectedLayer
+│   │
+│   ├── loss.py                 # Loss functions
+│   │   └── StyleGAN2Loss       # Main loss class
+│   │       ├── run_G()         # Generator forward
+│   │       ├── run_D()         # Discriminator forward
+│   │       └── accumulate_gradients()
+│   │
+│   ├── training_loop.py        # Training orchestration
+│   │   └── training_loop()     # Main training function
+│   │
+│   ├── augment.py              # ADA implementation
+│   │   └── AugmentPipe         # Augmentation pipeline
+│   │
+│   └── dataset.py              # Data loading
+│       └── ImageFolderDataset  # Dataset class
+│
+├── torch_utils/                # PyTorch utilities
+│   ├── ops/                    # Custom CUDA operations
+│   │   ├── upfirdn2d.py       # Upsampling/downsampling
+│   │   ├── bias_act.py        # Fused bias+activation
+│   │   ├── conv2d_*.py        # Specialized convolutions
+│   │   └── fma.py             # Fused multiply-add
+│   ├── persistence.py          # Model serialization
+│   ├── misc.py                 # Helper functions
+│   └── training_stats.py       # Statistics tracking
+│
+├── metrics/                    # Quality metrics
+│   ├── frechet_inception_distance.py
+│   ├── kernel_inception_distance.py
+│   ├── precision_recall.py
+│   └── perceptual_path_length.py
+│
+└── dnnlib/                     # Deep learning library
+    ├── util.py                 # Utilities
+    └── __init__.py
+```
+
+---
+
+## Performance Optimizations
+
+### 1. Custom CUDA Kernels
+
+```python
+# Fused operations for performance
+torch_utils/ops/
+├── upfirdn2d       # Efficient resampling
+├── bias_act        # Fused bias + activation
+├── conv2d_gradfix  # Gradient fixes for conv
+└── grid_sample_gradfix  # Grid sampling gradients
+```
+
+### 2. Mixed Precision Training
+
+```python
+# Automatic mixed precision
+num_fp16_res: 4  # Top 4 resolutions use FP16
+
+Benefits:
+- 30-50% faster training
+- 40% less GPU memory
+- Minimal quality impact
+```
+
+### 3. Distributed Training
+
+```python
+# Multi-GPU support
+torch.nn.parallel.DistributedDataParallel
+
+# Efficient synchronization
+- Gradient synchronization controlled per phase
+- Selective sync for main/regularization phases
+```
+
+### 4. Lazy Regularization
+
+```python
+# R1 regularization every 16 iterations
+if phase in ['Dreg', 'Dboth']:
+    apply_r1_penalty()
+
+Speedup: ~15-20% faster training
+```
+
+---
+
+## Key Takeaways
+
+### Architecture Strengths
+
+1. **Style-Based Generation**
+   - Fine-grained control over generated features
+   - Excellent interpolation properties
+   - Disentangled latent space
+
+2. **Progressive Synthesis**
+   - Stable high-resolution training
+   - Hierarchical feature learning
+   - Efficient multi-scale generation
+
+3. **Adaptive Augmentation**
+   - Enables training with limited data
+   - No manual tuning required
+   - Architecture-agnostic
+
+4. **Robust Regularization**
+   - Path length regularization for smooth latent space
+   - R1 penalty for stable discriminator
+   - Lazy regularization for efficiency
+
+### Computational Requirements
+
+```
+Recommended Setup:
+- 8× NVIDIA V100 GPUs (32GB)
+- 1024×1024 resolution
+- Batch size: 32 total (4 per GPU)
+- Training time: ~7 days for 25M images
+
+Minimum Setup:
+- 1× GPU with 12GB+ VRAM
+- Lower resolution (256×256 or 512×512)
+- Smaller batch size
+- Longer training time
+```
+
+### Common Use Cases
+
+1. **High-Quality Image Generation**
+   - Face generation (FFHQ)
+   - Animal generation (AFHQ)
+   - Artistic generation (MetFaces, WikiArt)
+
+2. **Transfer Learning**
+   - Fine-tune pre-trained models
+   - Domain adaptation
+   - Style transfer
+
+3. **Research Applications**
+   - GAN inversion
+   - Image editing
+   - Latent space exploration
+   - Few-shot learning
+
+---
+
+## References
+
+**Original Papers:**
+- StyleGAN2-ADA: [Training Generative Adversarial Networks with Limited Data](https://arxiv.org/abs/2006.06676) (Karras et al., 2020)
+- StyleGAN2: [Analyzing and Improving the Image Quality of StyleGAN](https://arxiv.org/abs/1912.04958) (Karras et al., 2020)
+- StyleGAN: [A Style-Based Generator Architecture for Generative Adversarial Networks](https://arxiv.org/abs/1812.04948) (Karras et al., 2019)
+
+**Implementation:**
+- Official PyTorch implementation: [NVlabs/stylegan2-ada-pytorch](https://github.com/NVlabs/stylegan2-ada-pytorch)
+- Original TensorFlow version: [NVlabs/stylegan2-ada](https://github.com/NVlabs/stylegan2-ada)
+
+---
+
+*This documentation provides a comprehensive overview of the StyleGAN2-ADA architecture. For detailed implementation specifics, refer to the source code in the repository.*
